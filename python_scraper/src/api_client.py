@@ -1,207 +1,197 @@
-import requests
 import logging
-from typing import List
-from .models import Dipartimento, CorsoDiStudi, Insegnamento, SchedaOpis
-from src.transformers import (
+from typing import List, Protocol, runtime_checkable
+
+from .config import ApiConfig
+from .http_client import HttpClient, RequestsHttpClient
+from .models import CorsoDiStudi, Dipartimento, Insegnamento, SchedaOpis
+from .transformers import (
     parse_course_name,
     parse_insegnamento_data,
     parse_scheda_opis_data,
 )
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
 
-BASE_URL = "https://public.smartedu.unict.it/EnqaDataViewer"
-HEADERS = {
-    "Content-Type": "application/json",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-}
 
-TIMEOUT = 120
+@runtime_checkable
+class ApiClient(Protocol):
+    """
+    Interface for API client. enables abstracting away the underlying implementation (e.g. SmartEduApiClient).
+    """
 
-retry_strategy = Retry(
-    total=3,
-    backoff_factor=2,
-    status_forcelist=[429, 500, 502, 503, 504],
-    allowed_methods=["POST"],
-)
-adapter = HTTPAdapter(max_retries=retry_strategy)
+    def get_departments(self, year: int) -> List[Dipartimento]: ...
+
+    def get_courses(self, year: int, department_code: int) -> List[CorsoDiStudi]: ...
+
+    def get_activities(
+        self, year: int, dept_code: int, course_code: str
+    ) -> List[Insegnamento]: ...
+
+    def get_questions(
+        self,
+        year: int,
+        dept_code: int,
+        course_code: str,
+        activity_code: int,
+        professor_tax: str,
+    ) -> List[SchedaOpis]: ...
 
 
-session = requests.Session()
-session.headers.update(HEADERS)
-session.mount("https://", adapter)
-session.mount("http://", adapter)
+class SmartEduApiClient:
+    """
+    implementation of ApiClient. It uses an HttpClient to perform the actual HTTP requests.
+    """
 
+    def __init__(self, http_client: HttpClient, config: ApiConfig) -> None:
+        self._http = http_client
+        self._config = config
 
-def get_departments(year: int) -> List[Dipartimento]:
-    url = f"{BASE_URL}/getDepartments"
+    @classmethod
+    def create(cls, config: ApiConfig | None = None) -> "SmartEduApiClient":
+        """Factory method for creating an instance of SmartEduApiClient with a RequestsHttpClient and the given configuration."""
+        cfg = config or ApiConfig()
+        return cls(http_client=RequestsHttpClient(cfg), config=cfg)
 
-    payload = {"surveys": "", "academicYear": year}
+    def _url(self, endpoint: str) -> str:
+        return f"{self._config.base_url}/{endpoint}"
 
-    try:
-        response = session.post(url, json=payload, timeout=TIMEOUT)
-        response.raise_for_status()
+    @staticmethod
+    def _format_year(year: int) -> str:
+        return f"{year}/{year + 1}"
 
-        data = response.json()
+    @staticmethod
+    def _base_payload() -> dict:
+        return {"surveys": ""}
 
-        items = data.get("data", [])
+    def get_departments(self, year: int) -> List[Dipartimento]:
+        payload = {**self._base_payload(), "academicYear": year}
+        formatted_year = self._format_year(year)
 
-        departments = []
-        formatted_year = f"{year}/{year + 1}"
+        try:
+            data = self._http.post(self._url("getDepartments"), payload)
+        except Exception as e:
+            logger.error(f"Errore API dipartimenti (anno {year}): {e}")
+            return []
 
-        for item in items:
-            if item.get("code") is None:
-                continue
-
-            dip = Dipartimento(
+        return [
+            Dipartimento(
                 unict_id=int(item["code"]),
                 nome=item["name"],
                 anno_accademico=formatted_year,
             )
-            departments.append(dip)
+            for item in data.get("data", [])
+            if item.get("code") is not None
+        ]
 
-        return departments
+    def get_courses(self, year: int, department_code: int) -> List[CorsoDiStudi]:
+        payload = {
+            **self._base_payload(),
+            "academicYear": year,
+            "departmentCode": str(department_code),
+        }
+        formatted_year = self._format_year(year)
 
-    except requests.exceptions.RequestException as e:
-        logger.error(
-            f"Errore durante la richiesta API dipartimenti per l'anno {year}: {e}"
-        )
-        return []
-
-
-def get_courses(year: int, department_code: int) -> List[CorsoDiStudi]:
-
-    url = f"{BASE_URL}/getCourses"
-
-    payload = {
-        "surveys": "",
-        "academicYear": year,
-        "departmentCode": str(department_code),
-    }
-
-    try:
-        response = session.post(url, json=payload, timeout=TIMEOUT)
-        response.raise_for_status()
-
-        data = response.json()
-        items = data.get("data", [])
+        try:
+            data = self._http.post(self._url("getCourses"), payload)
+        except Exception as e:
+            logger.error(
+                f"Errore API corsi (dipartimento {department_code}, anno {year}): {e}"
+            )
+            return []
 
         corsi = []
-        formatted_year = f"{year}/{year + 1}"
-
-        for item in items:
-
+        for item in data.get("data", []):
             if item.get("code") is None:
                 continue
-
-            full_name = item["name"]
-            nome_pulito, classe = parse_course_name(full_name)
-
-            corso = CorsoDiStudi(
-                unict_id=item["code"],
-                nome=nome_pulito,
-                classe=classe,
-                anno_accademico=formatted_year,
-                dipartimento_id=department_code,
+            nome, classe = parse_course_name(item["name"])
+            corsi.append(
+                CorsoDiStudi(
+                    unict_id=item["code"],
+                    nome=nome,
+                    classe=classe,
+                    anno_accademico=formatted_year,
+                    dipartimento_id=department_code,
+                )
             )
-            corsi.append(corso)
-
         return corsi
 
-    except requests.exceptions.RequestException as e:
-        logger.error(f"Errore API Corsi (Dip: {department_code}, Anno: {year}): {e}")
-        return []
+    def get_activities(
+        self, year: int, dept_code: int, course_code: str
+    ) -> List[Insegnamento]:
+        payload = {
+            **self._base_payload(),
+            "academicYear": year,
+            "departmentCode": str(dept_code),
+            "courseCode": course_code,
+        }
+        formatted_year = self._format_year(year)
 
-
-def get_activities(year: int, dept_code: int, course_code: str) -> List[Insegnamento]:
-
-    url = f"{BASE_URL}/getActivities"
-
-    payload = {
-        "surveys": "",
-        "academicYear": year,
-        "departmentCode": str(dept_code),
-        "courseCode": course_code,
-    }
-
-    try:
-        response = session.post(url, json=payload, timeout=TIMEOUT)
-        response.raise_for_status()
-
-        data = response.json()
-        items = data.get("data", [])
+        try:
+            data = self._http.post(self._url("getActivities"), payload)
+        except Exception as e:
+            logger.error(
+                f"Errore API insegnamenti (corso {course_code}, "
+                f"dipartimento {dept_code}, anno {year}): {e}"
+            )
+            return []
 
         insegnamenti = []
-        formatted_year = f"{year}/{year + 1}"
-
-        for item in items:
-
-            insegnamento_data = parse_insegnamento_data(item)
-
-            if not insegnamento_data:
+        for item in data.get("data", []):
+            parsed = parse_insegnamento_data(item)
+            if parsed is None:
                 logger.warning(
-                    f"      [SKIP MATERIA] '{item.get('activityName')}' ignorata. "
-                    f"Codice GOMP vuoto o alfanumerico: {item.get('activityCode')}"
+                    f"[SKIP] '{item.get('activityName')}' codice docente: {item.get('professorTaxCode', 'N/A')} ignorata — "
+                    f"codice GOMP vuoto o alfanumerico: {item.get('activityCode')}"
                 )
                 continue
-
-            insegnamento = Insegnamento(
-                codice_gomp=insegnamento_data["codice_gomp"],
-                id_cds=course_code,
-                anno_accademico=formatted_year,
-                nome=insegnamento_data["nome"],
-                docente=insegnamento_data["docente"],
-                professor_tax=insegnamento_data["professor_tax"],
-                canale=insegnamento_data["canale"],
-                id_modulo=insegnamento_data["id_modulo"],
-                ssd=insegnamento_data["ssd"],
+            insegnamenti.append(
+                Insegnamento(
+                    codice_gomp=parsed["codice_gomp"],
+                    id_cds=course_code,
+                    anno_accademico=formatted_year,
+                    nome=parsed["nome"],
+                    docente=parsed["docente"],
+                    professor_tax=parsed["professor_tax"],
+                    canale=parsed["canale"],
+                    id_modulo=parsed["id_modulo"],
+                    ssd=parsed["ssd"],
+                )
             )
-            insegnamenti.append(insegnamento)
-
         return insegnamenti
-    except requests.exceptions.RequestException as e:
-        logger.error(
-            f"Errore API Insegnamenti (Corso: {course_code}, Dip: {dept_code}, Anno: {year}): {e}"
-        )
-        return []
 
+    def get_questions(
+        self,
+        year: int,
+        dept_code: int,
+        course_code: str,
+        activity_code: int,
+        professor_tax: str,
+    ) -> List[SchedaOpis]:
+        payload = {
+            **self._base_payload(),
+            "academicYear": year,
+            "departmentCode": str(dept_code),
+            "courseCode": course_code,
+            "activityCode": str(activity_code),
+            "partCode": "null",
+            "professor": professor_tax,
+        }
+        formatted_year = self._format_year(year)
 
-def get_questions(
-    year: int, dept_code: int, course_code: str, activity_code: int, professor_tax: str
-) -> List[SchedaOpis]:
+        try:
+            data = self._http.post(self._url("getQuestions"), payload)
+        except Exception as e:
+            logger.error(
+                f"Errore API schede OPIS (activity {activity_code}, "
+                f"corso {course_code}, dipartimento {dept_code}, anno {year}): {e}"
+            )
+            return []
 
-    url = f"{BASE_URL}/getQuestions"
-
-    payload = {
-        "surveys": "",
-        "academicYear": year,
-        "departmentCode": str(dept_code),
-        "courseCode": course_code,
-        "activityCode": str(activity_code),
-        "partCode": "null",
-        "professor": professor_tax,
-    }
-
-    try:
-        response = session.post(url, json=payload, timeout=TIMEOUT)
-        response.raise_for_status()
-        data = response.json()
-    except requests.exceptions.RequestException as e:
-        logger.error(
-            f"Errore API Schede Opis (Activity: {activity_code}, Corso: {course_code}, Dip: {dept_code}, Anno: {year}): {e}"
-        )
-        return []
-
-    schede_opis_data = parse_scheda_opis_data(data)
-
-    results = []
-    formatted_year = f"{year}/{year + 1}"
-
-    for item in schede_opis_data:
-        item["anno_accademico"] = formatted_year
-        item["id_insegnamento"] = activity_code
-        results.append(SchedaOpis(**item))
-
-    return results
+        return [
+            SchedaOpis(
+                **item,
+                anno_accademico=formatted_year,
+                id_insegnamento=activity_code,
+            )
+            for item in parse_scheda_opis_data(data)
+        ]
