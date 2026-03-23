@@ -1,229 +1,365 @@
-import mysql.connector
 import pytest
-from unittest.mock import MagicMock
-from src import database
-from src.models import Dipartimento, CorsoDiStudi, Insegnamento, SchedaOpis
+import mysql.connector
+
+from src.config import DbConfig
+from src.database import MySqlDatabaseClient
+from src.models import CorsoDiStudi, Dipartimento, Insegnamento, SchedaOpis
 
 
-@pytest.fixture(autouse=True)
-def reset_db_connection():
-    database._connection = None
-    yield
-    database._connection = None
+class StubCursor:
+    """
+    Stub for mysql.connector.cursor.
+
+    configurable attributes:
+        fetchone_return  — value returned by fetchone()
+        lastrowid        — id of the last inserted row
+        execute_error    — if setted, execute() raises this error
+        executemany_error — if setted, executemany() raises this error
+
+    inspection attributes:
+        execute_calls    — list of (query, params) received by execute()
+        executemany_calls — list of (query, params) received by executemany()
+        closed           — True if close() has been called
+    """
+
+    def __init__(self) -> None:
+        self.fetchone_return: object = None
+        self.lastrowid: int | None = None
+        self.execute_error: Exception | None = None
+        self.executemany_error: Exception | None = None
+
+        self.execute_calls: list[tuple] = []
+        self.executemany_calls: list[tuple] = []
+        self.closed: bool = False
+
+    def execute(self, query: str, params: tuple = ()) -> None:
+        if self.execute_error:
+            raise self.execute_error
+        self.execute_calls.append((query, params))
+
+    def executemany(self, query: str, params: list) -> None:
+        if self.executemany_error:
+            raise self.executemany_error
+        self.executemany_calls.append((query, params))
+
+    def fetchone(self) -> object:
+        return self.fetchone_return
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class StubConnection:
+    """
+    Stub for mysql.connector.connect().
+
+    Inspection attributes:
+        committed — True if commit() has been called
+        closed    — True if close() has been called
+    """
+
+    def __init__(self, cursor: StubCursor) -> None:
+        self._cursor = cursor
+        self.committed: bool = False
+        self.closed: bool = False
+
+    def cursor(self) -> StubCursor:
+        return self._cursor
+
+    def commit(self) -> None:
+        self.committed = True
+
+    def close(self) -> None:
+        self.closed = True
+
+    def is_connected(self) -> bool:
+        return not self.closed
 
 
 @pytest.fixture
-def mock_db_connection(mocker):
-    mock_conn = MagicMock()
-    mock_cursor = MagicMock()
+def connected_client(mocker):
+    """
+    Returns a tuple (MySqlDatabaseClient, StubCursor).
 
-    mock_conn.cursor.return_value = mock_cursor
+    The MySQL connector is mocked with a typed StubConnection.
+    The client is already connected and ready for assertions.
+    """
+    cursor = StubCursor()
+    conn = StubConnection(cursor)
+    mocker.patch("src.database.mysql.connector.connect", return_value=conn)
 
-    mocker.patch("src.database.mysql.connector.connect", return_value=mock_conn)
-
-    database._connection = mock_conn
-
-    return mock_conn, mock_cursor
+    client = MySqlDatabaseClient(DbConfig())
+    client.connect()
+    return client, cursor
 
 
-def test_connect_to_db(mocker):
-    # act
-    mock_connect = mocker.patch("src.database.mysql.connector.connect")
-    database.connect_to_db()
+def test_connect_opens_connection(mocker) -> None:
+    cursor = StubCursor()
+    mock_connect = mocker.patch(
+        "src.database.mysql.connector.connect",
+        return_value=StubConnection(cursor),
+    )
 
-    # assert
+    client = MySqlDatabaseClient(DbConfig())
+    client.connect()
+
     mock_connect.assert_called_once()
-    assert database._connection is not None
+    assert client._connection is not None
 
 
-def test_insert_department_success(mock_db_connection):
-    mock_conn, mock_cursor = mock_db_connection
-    mock_cursor.fetchone.return_value = (99,)
-
-    dip = Dipartimento(unict_id=123, nome="Informatica", anno_accademico="2023/2024")
-
-    # act
-    result = database.insert_department(dip)
-
-    # assert
-    assert result == 99
-    assert mock_cursor.execute.call_count == 2
-    mock_conn.commit.assert_called_once()
-    mock_cursor.close.assert_called_once()
-
-
-def test_insert_department_failure(mock_db_connection, caplog):
-    _, mock_cursor = mock_db_connection
-    mock_cursor.execute.side_effect = mysql.connector.Error("Errore DB")
-    dip = Dipartimento(unict_id=123, nome="Informatica", anno_accademico="2023/2024")
-
-    # act
-    result = database.insert_department(dip)
-
-    # assert
-    assert result == -1
-    assert "Errore DB durante l'inserimento del dipartimento" in caplog.text
-
-
-def test_insert_course(mock_db_connection):
-    mock_conn, mock_cursor = mock_db_connection
-    mock_cursor.fetchone.return_value = (42,)
-
-    corso = CorsoDiStudi(
-        unict_id="M12",
-        nome="Matematica",
-        classe="LM-40",
-        anno_accademico="2023/2024",
-        dipartimento_id=123,
+def test_connect_failure_raises_and_logs(mocker, caplog) -> None:
+    mocker.patch(
+        "src.database.mysql.connector.connect",
+        side_effect=mysql.connector.Error("Credenziali errate"),
     )
-
-    # act
-    result = database.insert_course(corso, dipartimento_internal_id=99)
-
-    # assert
-    assert result == 42
-    assert mock_cursor.execute.call_count == 2
-    mock_conn.commit.assert_called_once()
-
-
-def test_insert_course_failure(mock_db_connection, caplog):
-    _, mock_cursor = mock_db_connection
-    mock_cursor.execute.side_effect = mysql.connector.Error("Errore DB")
-    corso = CorsoDiStudi(
-        unict_id="M12",
-        nome="Matematica",
-        classe="LM-40",
-        anno_accademico="2023/2024",
-        dipartimento_id=123,
-    )
-
-    # act
-    result = database.insert_course(corso, dipartimento_internal_id=99)
-
-    # assert
-    assert result == -1
-    assert "Errore DB durante l'inserimento del corso" in caplog.text
-
-
-def test_insert_insegnamento(mock_db_connection):
-    mock_conn, mock_cursor = mock_db_connection
-    mock_cursor.lastrowid = 100
-
-    ins = Insegnamento(
-        codice_gomp=1010,
-        id_cds="M12",
-        anno_accademico="2023/2024",
-        nome="Analisi I",
-        docente="Mario Rossi",
-        professor_tax="",
-    )
-
-    # act
-    result = database.insert_insegnamento(ins, corso_internal_id=42)
-
-    # assert
-    assert result == 100
-    mock_cursor.execute.assert_called_once()
-    mock_conn.commit.assert_called_once()
-
-
-def test_insert_insegnamento_failure(mock_db_connection, caplog):
-    _, mock_cursor = mock_db_connection
-    mock_cursor.execute.side_effect = mysql.connector.Error("Errore DB")
-    ins = Insegnamento(
-        codice_gomp=1010,
-        id_cds="M12",
-        anno_accademico="2023/2024",
-        nome="Analisi I",
-        docente="Mario Rossi",
-        professor_tax="",
-    )
-
-    result = database.insert_insegnamento(ins, corso_internal_id=42)
-
-    assert result == -1
-    assert "Errore DB durante l'inserimento dell'insegnamento" in caplog.text
-
-
-def test_insert_schede_opis(mock_db_connection):
-    mock_conn, mock_cursor = mock_db_connection
-
-    scheda = SchedaOpis(
-        anno_accademico="2023/2024",
-        id_insegnamento=1010,
-        totale_schede=5,
-        totale_schede_nf=0,
-        fc=0,
-        inatt_nf=0,
-        domande=[1, 2, 3],
-        domande_nf=[],
-        motivo_nf=[],
-        sugg=[],
-        sugg_nf=[],
-    )
-
-    # act
-    database.insert_schede_opis([scheda], insegnamento_internal_id=100)
-
-    # assert
-    mock_cursor.executemany.assert_called_once()
-    args, _ = mock_cursor.executemany.call_args
-    query_eseguita = args[0]
-    valori_passati = args[1]
-
-    assert "INSERT INTO schede_opis" in query_eseguita
-    assert len(valori_passati) == 1
-
-    riga_inserita = valori_passati[0]
-    assert "[1, 2, 3]" in riga_inserita
-    mock_conn.commit.assert_called_once()
-
-
-def test_insert_schede_opis_failure(mock_db_connection, caplog):
-    _, mock_cursor = mock_db_connection
-    mock_cursor.executemany.side_effect = mysql.connector.Error("Errore DB")
-    scheda = SchedaOpis(
-        anno_accademico="2023/2024",
-        id_insegnamento=1010,
-        totale_schede=5,
-        totale_schede_nf=0,
-        fc=0,
-        inatt_nf=0,
-        domande=[1, 2, 3],
-        domande_nf=[],
-        motivo_nf=[],
-        sugg=[],
-        sugg_nf=[],
-    )
-
-    database.insert_schede_opis([scheda], insegnamento_internal_id=100)
-
-    assert "Errore DB durante il salvataggio" in caplog.text
-
-
-def test_connect_to_db_failure(mocker, caplog):
-    mock_connect = mocker.patch("src.database.mysql.connector.connect")
-    mock_connect.side_effect = mysql.connector.Error("Credenziali errate")
 
     with pytest.raises(mysql.connector.Error):
-        database.connect_to_db()
+        MySqlDatabaseClient(DbConfig()).connect()
 
     assert "Errore di connessione a MySQL" in caplog.text
 
 
-def test_close_connection():
-    mock_conn = MagicMock()
-    mock_conn.is_connected.return_value = True
-    database._connection = mock_conn
+def test_close_calls_connection_close(mocker) -> None:
+    cursor = StubCursor()
+    conn = StubConnection(cursor)
+    mocker.patch("src.database.mysql.connector.connect", return_value=conn)
 
-    database.close_connection()
+    client = MySqlDatabaseClient(DbConfig())
+    client.connect()
+    client.close()
 
-    mock_conn.close.assert_called_once()
+    assert conn.closed
 
 
-def test_inserts_without_connection(caplog):
-    database._connection = None
-    dip = Dipartimento(unict_id=1, nome="Dipartimento", anno_accademico="23/24")
+def test_context_manager_closes_on_exit(mocker) -> None:
+    cursor = StubCursor()
+    conn = StubConnection(cursor)
+    mocker.patch("src.database.mysql.connector.connect", return_value=conn)
+
+    with MySqlDatabaseClient(DbConfig()):
+        pass
+
+    assert conn.closed
+
+
+@pytest.mark.parametrize(
+    "fetchone_return, expected_id",
+    [
+        ((99,), 99),  # row found → returns the id
+        (None, -1),  # INSERT IGNORE did not insert, SELECT found nothing
+    ],
+    ids=["found", "not_found"],
+)
+def test_insert_department(connected_client, fetchone_return, expected_id) -> None:
+    client, cursor = connected_client
+    cursor.fetchone_return = fetchone_return
+
+    dip = Dipartimento(unict_id=123, nome="Informatica",
+                       anno_accademico="2023/2024")
+    result = client.insert_department(dip)
+
+    assert result == expected_id
+    assert len(cursor.execute_calls) == 2  # INSERT + SELECT
+    assert cursor.closed
+
+
+def test_insert_department_db_error(connected_client, caplog) -> None:
+    client, cursor = connected_client
+    cursor.execute_error = mysql.connector.Error("Errore DB")
+
+    dip = Dipartimento(unict_id=123, nome="Informatica",
+                       anno_accademico="2023/2024")
+
+    assert client.insert_department(dip) == -1
+    assert "Errore DB inserimento dipartimento" in caplog.text
+
+
+def test_insert_department_without_connection() -> None:
+    client = MySqlDatabaseClient(DbConfig())
+    dip = Dipartimento(unict_id=1, nome="Dip", anno_accademico="23/24")
+
+    assert client.insert_department(dip) == -1
+
+
+@pytest.mark.parametrize(
+    "fetchone_return, expected_id",
+    [
+        ((42,), 42),
+        (None, -1),
+    ],
+    ids=["found", "not_found"],
+)
+def test_insert_course(connected_client, fetchone_return, expected_id) -> None:
+    client, cursor = connected_client
+    cursor.fetchone_return = fetchone_return
+
+    corso = CorsoDiStudi(
+        unict_id="M12",
+        nome="Matematica",
+        classe="LM-40",
+        anno_accademico="2023/2024",
+        dipartimento_id=123,
+    )
+    result = client.insert_course(corso, dipartimento_internal_id=99)
+
+    assert result == expected_id
+    assert len(cursor.execute_calls) == 2  # INSERT + SELECT
+
+
+def test_insert_course_db_error(connected_client, caplog) -> None:
+    client, cursor = connected_client
+    cursor.execute_error = mysql.connector.Error("Errore DB")
+
+    corso = CorsoDiStudi(
+        unict_id="M12",
+        nome="Matematica",
+        classe="LM-40",
+        anno_accademico="2023/2024",
+        dipartimento_id=123,
+    )
+
+    assert client.insert_course(corso, dipartimento_internal_id=99) == -1
+    assert "Errore DB inserimento corso" in caplog.text
+
+
+def test_insert_course_without_connection() -> None:
+    client = MySqlDatabaseClient(DbConfig())
+    corso = CorsoDiStudi(
+        unict_id="C1",
+        nome="Corso",
+        classe="L",
+        anno_accademico="23/24",
+        dipartimento_id=1,
+    )
+
+    assert client.insert_course(corso, 1) == -1
+
+
+def test_insert_insegnamento_success(connected_client) -> None:
+    client, cursor = connected_client
+    cursor.lastrowid = 100
+
+    ins = Insegnamento(
+        codice_gomp=1010,
+        id_cds="M12",
+        anno_accademico="2023/2024",
+        nome="Analisi I",
+        docente="Mario Rossi",
+        professor_tax="",
+    )
+
+    result = client.insert_insegnamento(ins, corso_internal_id=42)
+
+    assert result == 100
+    assert len(cursor.execute_calls) == 1
+
+
+def test_insert_insegnamento_db_error(connected_client, caplog) -> None:
+    client, cursor = connected_client
+    cursor.execute_error = mysql.connector.Error("Errore DB")
+
+    ins = Insegnamento(
+        codice_gomp=1010,
+        id_cds="M12",
+        anno_accademico="2023/2024",
+        nome="Analisi I",
+        docente="Mario Rossi",
+        professor_tax="",
+    )
+
+    assert client.insert_insegnamento(ins, corso_internal_id=42) == -1
+    assert "Errore DB inserimento insegnamento" in caplog.text
+
+
+def test_insert_insegnamento_without_connection() -> None:
+    client = MySqlDatabaseClient(DbConfig())
+    ins = Insegnamento(
+        codice_gomp=1,
+        id_cds="C1",
+        anno_accademico="23/24",
+        nome="Materia",
+        docente="Doc",
+        professor_tax="",
+    )
+
+    assert client.insert_insegnamento(ins, 1) == -1
+
+
+def test_insert_schede_opis_success(connected_client) -> None:
+    client, cursor = connected_client
+
+    scheda = SchedaOpis(
+        anno_accademico="2023/2024",
+        id_insegnamento=1010,
+        totale_schede=5,
+        totale_schede_nf=0,
+        fc=0,
+        inatt_nf=0,
+        domande=[1, 2, 3],
+        domande_nf=[],
+        motivo_nf=[],
+        sugg=[],
+        sugg_nf=[],
+    )
+
+    client.insert_schede_opis([scheda], insegnamento_internal_id=100)
+
+    assert len(cursor.executemany_calls) == 1
+    query, val_list = cursor.executemany_calls[0]
+    assert "INSERT INTO schede_opis" in query
+    assert len(val_list) == 1
+    assert "[1, 2, 3]" in val_list[0]
+
+
+def test_insert_schede_opis_db_error(connected_client, caplog) -> None:
+    client, cursor = connected_client
+    cursor.executemany_error = mysql.connector.Error("Errore DB")
+
+    scheda = SchedaOpis(
+        anno_accademico="2023/2024",
+        id_insegnamento=1010,
+        totale_schede=5,
+        totale_schede_nf=0,
+        fc=0,
+        inatt_nf=0,
+        domande=[1, 2, 3],
+        domande_nf=[],
+        motivo_nf=[],
+        sugg=[],
+        sugg_nf=[],
+    )
+
+    client.insert_schede_opis([scheda], insegnamento_internal_id=100)
+
+    assert "Errore DB salvataggio" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "schede, disconnect_before",
+    [
+        ([], False),  # empty list → no executemany
+        (None, True),  # no connection → no executemany
+    ],
+    ids=["empty_list", "no_connection"],
+)
+def test_insert_schede_opis_skipped(
+    connected_client, schede, disconnect_before
+) -> None:
+    client, cursor = connected_client
+
+    if disconnect_before:
+        client._connection = None
+
+    client.insert_schede_opis(schede or [], insegnamento_internal_id=100)
+
+    assert len(cursor.executemany_calls) == 0
+
+
+def test_all_inserts_without_connection(caplog) -> None:
+    """Without a connection, all insert methods should return -1 or do nothing, and log an error."""
+    client = MySqlDatabaseClient(DbConfig())
+
+    dip = Dipartimento(unict_id=1, nome="Dip", anno_accademico="23/24")
     corso = CorsoDiStudi(
         unict_id="C1",
         nome="Corso",
@@ -235,26 +371,27 @@ def test_inserts_without_connection(caplog):
         codice_gomp=1,
         id_cds="C1",
         anno_accademico="23/24",
-        nome="Materia",
+        nome="Mat",
         docente="Doc",
         professor_tax="",
     )
     scheda = SchedaOpis(
         anno_accademico="23/24",
-        id_insegnamento=1010,
-        totale_schede=5,
+        id_insegnamento=1,
+        totale_schede=0,
         totale_schede_nf=0,
         fc=0,
         inatt_nf=0,
-        domande=[1, 2],
+        domande=[],
         domande_nf=[],
         motivo_nf=[],
         sugg=[],
         sugg_nf=[],
     )
 
-    assert database.insert_department(dip) == -1
+    assert client.insert_department(dip) == -1
+    assert client.insert_course(corso, 1) == -1
+    assert client.insert_insegnamento(ins, 1) == -1
+    client.insert_schede_opis([scheda], 1)  # must end silently
+
     assert "Database non connesso" in caplog.text
-    assert database.insert_course(corso, 1) == -1
-    assert database.insert_insegnamento(ins, 1) == -1
-    assert database.insert_schede_opis([scheda], 1) is None
